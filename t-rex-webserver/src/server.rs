@@ -18,7 +18,6 @@ use log::Level;
 use num_cpus;
 use open;
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::str;
 use std::str::FromStr;
 
@@ -48,13 +47,13 @@ xxxxxx
 xxxxxxx";
 
 async fn mvt_metadata(service: web::Data<MvtService>) -> Result<HttpResponse> {
-    let json = service.get_mvt_metadata().unwrap();
-    Ok(HttpResponse::Ok().json(json))
+    let json = service.get_mvt_metadata()?;
+    Ok(HttpResponse::Ok().json(&json))
 }
 
 /// Font list for Maputnik
 async fn fontstacks() -> Result<HttpResponse> {
-    Ok(HttpResponse::Ok().json(["Roboto Medium", "Roboto Regular"]))
+    Ok(HttpResponse::Ok().json(&["Roboto Medium", "Roboto Regular"]))
 }
 
 // Include method fonts() which returns HashMap with embedded font files
@@ -77,7 +76,7 @@ async fn fonts_pbf(params: web::Path<(String, String)>) -> Result<HttpResponse> 
                 .content_type("application/x-protobuf")
                 // data is already gzip compressed
                 .encoding(ContentEncoding::Identity)
-                .header(header::CONTENT_ENCODING, "gzip")
+                .append_header((header::CONTENT_ENCODING, "gzip"))
                 .body(*pbf); // TODO: chunked response
             break;
         }
@@ -96,11 +95,8 @@ async fn tileset_tilejson(
     req: HttpRequest,
 ) -> Result<HttpResponse> {
     let url = req_baseurl(&req);
-    let json =
-        web::block::<_, _, Infallible>(move || Ok(service.get_tilejson(&url, &tileset).unwrap()))
-            .await
-            .unwrap();
-    Ok(HttpResponse::Ok().json(json))
+    let json = web::block(move || service.get_tilejson(&url, &tileset).ok()).await?;
+    Ok(HttpResponse::Ok().json(&json))
 }
 
 async fn tileset_style_json(
@@ -108,19 +104,16 @@ async fn tileset_style_json(
     tileset: web::Path<String>,
     req: HttpRequest,
 ) -> Result<HttpResponse> {
-    let json = service.get_stylejson(&req_baseurl(&req), &tileset).unwrap();
-    Ok(HttpResponse::Ok().json(json))
+    let json = service.get_stylejson(&req_baseurl(&req), &tileset)?;
+    Ok(HttpResponse::Ok().json(&json))
 }
 
 async fn tileset_metadata_json(
     service: web::Data<MvtService>,
     tileset: web::Path<String>,
 ) -> Result<HttpResponse> {
-    let json =
-        web::block::<_, _, Infallible>(move || Ok(service.get_mbtiles_metadata(&tileset).unwrap()))
-            .await
-            .unwrap();
-    Ok(HttpResponse::Ok().json(json))
+    let json = web::block(move || service.get_mbtiles_metadata(&tileset).ok()).await?;
+    Ok(HttpResponse::Ok().json(&json))
 }
 
 async fn tile_pbf(
@@ -144,29 +137,23 @@ async fn tile_pbf(
                 .and_then(|headerstr| Some(headerstr.contains("gzip")))
         })
         .unwrap_or(false);
-    let tile = web::block::<_, _, Infallible>(move || {
-        Ok(service.tile_cached(&tileset, x, y, z, gzip, None))
-    })
-    .await;
-
+    // rust-postgres starts its own Tokio runtime
+    // without blocking we get 'Cannot start a runtime from within a runtime'
+    let tile = web::block(move || service.tile_cached(&tileset, x, y, z, gzip, None)).await?;
     let resp = match tile {
-        Ok(Some(tile)) => {
+        Some(tile) => {
             let mut r = HttpResponse::Ok();
             r.content_type("application/x-protobuf");
             if gzip {
                 // data is already gzip compressed
                 r.encoding(ContentEncoding::Identity)
-                    .header(header::CONTENT_ENCODING, "gzip");
+                    .append_header((header::CONTENT_ENCODING, "gzip"));
             }
             let cache_max_age = config.webserver.cache_control_max_age.unwrap_or(300);
-            r.header(header::CACHE_CONTROL, format!("max-age={}", cache_max_age));
+            r.append_header((header::CACHE_CONTROL, format!("max-age={}", cache_max_age)));
             r.body(tile) // TODO: chunked response
         }
-        Ok(None) => HttpResponse::NoContent().finish(),
-        Err(e) => {
-            error!("{}", e);
-            HttpResponse::InternalServerError().finish()
-        }
+        None => HttpResponse::NoContent().finish(),
     };
     Ok(resp)
 }
@@ -179,7 +166,7 @@ async fn static_file_handler(req: HttpRequest) -> Result<HttpResponse> {
     let key = req.path()[1..].to_string();
     let resp = if let Some(ref content) = STATIC_FILES.content(None, key) {
         HttpResponse::Ok()
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*") // TOOD: use Actix middleware
+            .append_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")) // TOOD: use Actix middleware
             .content_type(content.1)
             .body(content.0) // TODO: chunked response
     } else {
@@ -211,8 +198,8 @@ async fn drilldown_handler(
         })
         .collect();
     let stats = service.drilldown(tileset, params.minzoom, params.maxzoom, points, progress);
-    let json = stats.as_json().unwrap();
-    Ok(HttpResponse::Ok().json(json))
+    let json = stats.as_json()?;
+    Ok(HttpResponse::Ok().json(&json))
 }
 
 #[actix_web::main]
@@ -232,14 +219,14 @@ pub async fn webserver(args: ArgMatches<'static>) -> std::io::Result<()> {
     let static_dirs = config.webserver.static_.clone();
 
     let svc_config = config.clone();
-    let service = web::block::<_, _, Infallible>(move || {
+    let service = web::block(move || {
         let mut service = service_from_args(&svc_config, &args);
         service.prepare_feature_queries();
         service.init_cache();
-        Ok(service)
+        service
     })
     .await
-    .unwrap();
+    .expect("service initialization failed");
 
     let server = HttpServer::new(move || {
         let mut app = App::new()
@@ -247,12 +234,7 @@ pub async fn webserver(args: ArgMatches<'static>) -> std::io::Result<()> {
             .data(service.clone())
             .wrap(middleware::Logger::new("%r %s %b %Dms %a"))
             .wrap(Compress::default())
-            .wrap(
-                Cors::new()
-                    .send_wildcard()
-                    .allowed_methods(vec!["GET"])
-                    .finish(),
-            )
+            .wrap(Cors::default().send_wildcard().allowed_methods(vec!["GET"]))
             .service(
                 web::resource("/index.json").route(
                     web::route()
